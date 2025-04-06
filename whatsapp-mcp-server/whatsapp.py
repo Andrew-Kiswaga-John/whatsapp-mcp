@@ -5,6 +5,7 @@ from typing import Optional, List, Tuple
 import os.path
 import requests
 import json
+import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8000/api"
@@ -185,9 +186,9 @@ def print_recent_messages(limit=10) -> List[Message]:
         if 'conn' in locals():
             conn.close()
 
-
 def list_messages(
-    date_range: Optional[Tuple[datetime, datetime]] = None,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
     sender_phone_number: Optional[str] = None,
     chat_jid: Optional[str] = None,
     query: Optional[str] = None,
@@ -209,10 +210,24 @@ def list_messages(
         params = []
         
         # Add filters
-        if date_range:
-            where_clauses.append("messages.timestamp BETWEEN ? AND ?")
-            params.extend([date_range[0].isoformat(), date_range[1].isoformat()])
+        if after:
+            try:
+                after = datetime.fromisoformat(after)
+            except ValueError:
+                raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
             
+            where_clauses.append("messages.timestamp > ?")
+            params.append(after)
+
+        if before:
+            try:
+                before = datetime.fromisoformat(before)
+            except ValueError:
+                raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
+            
+            where_clauses.append("messages.timestamp < ?")
+            params.append(before)
+
         if sender_phone_number:
             where_clauses.append("messages.sender = ?")
             params.append(sender_phone_number)
@@ -663,16 +678,6 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             conn.close()
 
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
-    """Send a WhatsApp message to the specified recipient. For group messages use the JID.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us").
-        message: The message text to send
-        
-    Returns:
-        Tuple[bool, str]: A tuple containing success status and a status message
-    """
     try:
         # Validate input
         if not recipient:
@@ -681,7 +686,81 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
-            "message": message
+            "message": message,
+        }
+        
+        response = requests.post(url, json=payload)
+        
+        # Check if the request was successful
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+            
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+    try:
+        # Validate input
+        if not recipient:
+            return False, "Recipient must be provided"
+        
+        if not media_path:
+            return False, "Media path must be provided"
+        
+        if not os.path.isfile(media_path):
+            return False, f"Media file not found: {media_path}"
+        
+        url = f"{WHATSAPP_API_BASE_URL}/send"
+        payload = {
+            "recipient": recipient,
+            "media_path": media_path
+        }
+        
+        response = requests.post(url, json=payload)
+        
+        # Check if the request was successful
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+            
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
+    try:
+        # Validate input
+        if not recipient:
+            return False, "Recipient must be provided"
+        
+        if not media_path:
+            return False, "Media path must be provided"
+        
+        if not os.path.isfile(media_path):
+            return False, f"Media file not found: {media_path}"
+
+        if not media_path.endswith(".ogg"):
+            try:
+                media_path = audio.convert_to_opus_ogg_temp(media_path)
+            except Exception as e:
+                return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
+        
+        url = f"{WHATSAPP_API_BASE_URL}/send"
+        payload = {
+            "recipient": recipient,
+            "media_path": media_path
         }
         
         response = requests.post(url, json=payload)
