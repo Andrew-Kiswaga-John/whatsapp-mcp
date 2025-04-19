@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -358,8 +359,103 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
+// ChatSubscription represents a subscription to messages from a specific chat
+type ChatSubscription struct {
+	ChatJID    string
+	Messages   chan Message
+	LastAccess time.Time
+}
+
+// SubscriptionManager handles active chat subscriptions
+type SubscriptionManager struct {
+	subscriptions map[string]*ChatSubscription
+	mutex         sync.Mutex
+}
+
+// NewSubscriptionManager creates a new subscription manager
+func NewSubscriptionManager() *SubscriptionManager {
+	return &SubscriptionManager{
+		subscriptions: make(map[string]*ChatSubscription),
+	}
+}
+
+// Subscribe creates or returns an existing subscription for a chat
+func (sm *SubscriptionManager) Subscribe(chatJID string) *ChatSubscription {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	// Check if subscription already exists
+	if sub, exists := sm.subscriptions[chatJID]; exists {
+		sub.LastAccess = time.Now()
+		return sub
+	}
+
+	// Create new subscription
+	sub := &ChatSubscription{
+		ChatJID:    chatJID,
+		Messages:   make(chan Message, 100), // Buffer up to 100 messages
+		LastAccess: time.Now(),
+	}
+	sm.subscriptions[chatJID] = sub
+	return sub
+}
+
+// Unsubscribe removes a subscription
+func (sm *SubscriptionManager) Unsubscribe(chatJID string) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sub, exists := sm.subscriptions[chatJID]; exists {
+		close(sub.Messages)
+		delete(sm.subscriptions, chatJID)
+	}
+}
+
+// PublishMessage sends a message to all active subscriptions for a chat
+func (sm *SubscriptionManager) PublishMessage(chatJID string, msg Message) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sub, exists := sm.subscriptions[chatJID]; exists {
+		// Try to send, but don't block if channel is full
+		select {
+		case sub.Messages <- msg:
+			// Message sent successfully
+		default:
+			// Channel is full, log and continue
+			fmt.Printf("Warning: Message channel full for chat %s\n", chatJID)
+		}
+	}
+}
+
+// CleanupInactiveSubscriptions removes subscriptions that haven't been accessed recently
+func (sm *SubscriptionManager) CleanupInactiveSubscriptions(maxAge time.Duration) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	now := time.Now()
+	for chatJID, sub := range sm.subscriptions {
+		if now.Sub(sub.LastAccess) > maxAge {
+			close(sub.Messages)
+			delete(sm.subscriptions, chatJID)
+			fmt.Printf("Cleaned up inactive subscription for chat %s\n", chatJID)
+		}
+	}
+}
+
+
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Create subscription manager
+	subManager := NewSubscriptionManager()
+
+	// Start a goroutine to clean up inactive subscriptions
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			subManager.CleanupInactiveSubscriptions(15 * time.Minute)
+		}
+	}()
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -405,7 +501,109 @@ func startRESTServer(client *whatsmeow.Client, port int) {
 			Message: message,
 		})
 	})
+	// Handler for subscribing to messages from a specific chat
+	http.HandleFunc("/api/listen", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 
+		// Get phone number from query parameter
+		phoneNumber := r.URL.Query().Get("phone")
+		if phoneNumber == "" {
+			http.Error(w, "Phone number is required", http.StatusBadRequest)
+			return
+		}
+
+		// Convert phone number to JID if it's not already
+		var chatJID string
+		if strings.Contains(phoneNumber, "@") {
+			// Already a JID
+			chatJID = phoneNumber
+		} else {
+			// Create JID from phone number
+			chatJID = phoneNumber + "@s.whatsapp.net"
+		}
+
+		// Set headers for SSE
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		// Create a subscription for this chat
+		sub := subManager.Subscribe(chatJID)
+		defer subManager.Unsubscribe(chatJID)
+
+		// Create a done channel that's closed when the client disconnects
+		done := make(chan bool)
+		notify := w.(http.CloseNotifier).CloseNotify()
+		go func() {
+			<-notify
+			close(done)
+		}()
+
+		// Send any existing messages from the database
+		messages, err := messageStore.GetMessages(chatJID, 20)
+		if err == nil && len(messages) > 0 {
+			// Reverse the messages to send oldest first
+			for i := len(messages) - 1; i >= 0; i-- {
+				msg := messages[i]
+				data, _ := json.Marshal(msg)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				w.(http.Flusher).Flush()
+			}
+		}
+
+		// Listen for new messages
+		for {
+			select {
+			case msg, ok := <-sub.Messages:
+				if !ok {
+					// Channel was closed
+					return
+				}
+				// Send message as SSE event
+				data, _ := json.Marshal(msg)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				w.(http.Flusher).Flush()
+			case <-done:
+				// Client disconnected
+				return
+			case <-time.After(30 * time.Second):
+				// Send a keep-alive comment to prevent timeout
+				fmt.Fprintf(w, ": keep-alive\n\n")
+				w.(http.Flusher).Flush()
+			}
+		}
+	})
+
+	// Modify the event handler to publish messages to subscriptions
+	client.AddEventHandler(func(evt interface{}) {
+		switch v := evt.(type) {
+		case *events.Message:
+			// Process regular messages
+			content := extractTextContent(v.Message)
+			if content == "" {
+				return // Skip non-text messages
+			}
+
+			chatJID := v.Info.Chat.String()
+			sender := v.Info.Sender.User
+
+			// Create message object
+			msg := Message{
+				Time:     v.Info.Timestamp,
+				Sender:   sender,
+				Content:  content,
+				IsFromMe: v.Info.IsFromMe,
+			}
+
+			// Publish to any active subscriptions
+			subManager.PublishMessage(chatJID, msg)
+		}
+	})
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -538,7 +736,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, 8000)
+	startRESTServer(client,messageStore, 8000)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
